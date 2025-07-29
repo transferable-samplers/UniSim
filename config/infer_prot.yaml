@@ -1,11 +1,12 @@
 name: none
 mode: all
-test_set: ./dataset/ATLAS/test.jsonl
-ckpt: /path/to/ckpt/unisim_atlas.ckpt
+test_set: ./dataset/many-peptides-md.jsonl
+ckpt: /network/scratch/t/tanc/unisim_pepmd.ckpt 
+output_dir: /network/scratch/t/tanc/unisim_pepmd_results
 save_dir: null
-inf_step: 1_000
+inf_step: 100_000
 sde_step: 50
-temperature: 300
+temperature: 310
 guidance: 0.05
 use_energy_minim: true
 force_field: amber14-implicit

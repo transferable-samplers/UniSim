@@ -3,15 +3,17 @@ import openmm.unit as u
 from openmm import app
 import numpy as np
 
+from simulation.hacks import minimize_with_scipy
+
 
 def get_default_parameters():
     default_parameters = {
         "force-field": "amber14-implicit",
         "integrator": "LangevinMiddleIntegrator",
         "waterbox-pad": 1.0,
-        "temperature": 300,
+        "temperature": 310,
         "timestep": 1.0,
-        "friction": 0.5,
+        "friction": 0.3,
         "sampling": 100_000_000,
         "spacing": 1_000,
         "min-tol": 2.0,
@@ -43,6 +45,8 @@ def get_simulation_environment_integrator(parameters):
         )
     elif parameters["integrator"] == "LangevinMiddleIntegrator":
         # assert version.parse(mm.__version__) >= version.parse("7.5")
+        print("Using LangevinMiddleIntegrator"
+              f" with temperature={temperature}, friction={friction}, timestep={timestep}")
         integrator = mm.LangevinMiddleIntegrator(
             temperature * u.kelvin,
             friction / u.picosecond,
@@ -80,6 +84,9 @@ def get_simulation_environment_from_model(model, parameters=None):
         platform = mm.Platform.getPlatformByName('CUDA')
         properties = {'DeviceIndex': f'{parameters["gpu"]}'}
         simulation = mm.app.Simulation(model.topology, system, integrator, platform, properties)
+
+    # 🔹 Set atom positions from the Modeller
+    simulation.context.setPositions(model.positions)
 
     return simulation
 
@@ -122,17 +129,18 @@ def get_system(model, parameters):
         else:
             raise ValueError("Invalid forcefield parameter '%s'" % parameters["force-field"])
 
-        model.addExtraParticles(forcefield)
-
         # Peter Eastman recommends a large cutoff value for implicit solvent
         # models, around 20 Angstrom (= 2nm), see
         # https://github.com/openmm/openmm/issues/3104
         system = forcefield.createSystem(
             model.topology,
             nonbondedMethod=mm.app.CutoffNonPeriodic,
-            nonbondedCutoff=2.0 * u.nanometer,  # == 20 Angstrom
-            constraints=mm.app.HBonds,
+            nonbondedCutoff=2.0 * u.nanometer,
+            constraints=None,
         )
+
+        print('Using ManyPeptidesMD-adapted implicit solvent parameters.')
+
     elif parameters["force-field"] == "amber14-explicit":
         forcefield = mm.app.ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
         model.addExtraParticles(forcefield)
@@ -199,7 +207,7 @@ def get_force(simulation, positions):
     return forces
 
 
-def spring_constraint_energy_minimization(simulation, positions):
+def spring_constraint_energy_minimization(simulation, positions, maxiter=100000):
     spring_constant = 10.0 * u.kilocalories_per_mole / u.angstroms ** 2
     restraint = mm.CustomExternalForce('0.5 * k * ((x - x0)^2 + (y - y0)^2 + (z - z0)^2)')
     restraint.addPerParticleParameter('x0')
@@ -215,12 +223,11 @@ def spring_constraint_energy_minimization(simulation, positions):
 
     simulation.system.addForce(restraint)
     simulation.context.setPositions(positions)
-    tolerance = (2.39 * u.kilocalories_per_mole / u.angstroms ** 2) \
-        .value_in_unit(u.kilojoules_per_mole / u.nanometers ** 2)
-    simulation.minimizeEnergy(tolerance=tolerance)
+    count = minimize_with_scipy(simulation, maxiter=maxiter)
 
+    # when you now get the state it is already minimized 
     state = simulation.context.getState(getPositions=True)
     positions = state.getPositions(asNumpy=True) \
         .value_in_unit(u.nanometer) \
         .astype(np.float32)
-    return positions
+    return positions, count

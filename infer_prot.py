@@ -1,12 +1,6 @@
 import torch
-from torch.utils.data import DataLoader
-from scipy.special import softmax, logsumexp
-from openmm.app import PDBFile
+import openmm.unit as unit
 import time
-import glob
-import math
-import shutil
-import json
 import os
 import yaml
 import pandas as pd
@@ -21,6 +15,8 @@ from simulation import (
     spring_constraint_energy_minimization
 )
 
+from simulation.hacks import minimize_with_scipy
+
 ### set backend == "pytorch"
 os.environ["GEOMSTATS_BACKEND"] = "pytorch"
 
@@ -30,7 +26,7 @@ torch.set_default_dtype(torch.float32)
 
 def create_save_dir(args):
     if args.save_dir is None:
-        save_dir = '.'.join(args.ckpt.split('.')[:-1]) + '_results'
+        save_dir = f"{args.output_dir}/{args.max_iter_energy_minimization}_itermin_{args.energy_eval_budget}_evalbudget"
     else:
         save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -73,7 +69,9 @@ def main(args):
     cols = ['PDB', 'TIME']
     res = []
 
-    for pdb_name, pdb_path in zip(pdbs, test_set):
+    for pdb_loop_index, (pdb_name, pdb_path) in enumerate(zip(pdbs, test_set)):
+        if pdb_loop_index != int(args.index):
+            continue
         out_dir = os.path.join(save_dir, pdb_name)
         os.makedirs(out_dir, exist_ok=True)
         topology = md.load(pdb_path).topology
@@ -83,14 +81,28 @@ def main(args):
             param["force-field"] = args.force_field
             sim = get_simulation_environment_from_pdb(pdb_path, parameters=param)
 
+        print(f"Start inference for PDB {pdb_name}.")
+        start = time.time()
+
+        total_count = 0
+
+        energy_before = sim.context.getState(getEnergy=True).getPotentialEnergy()
+        print(f"Energy before minimization: {energy_before} kJ/mol")
+        minimization_steps = minimize_with_scipy(sim, maxiter=args.max_iter_energy_minimization)
+        energy_after = sim.context.getState(getEnergy=True).getPotentialEnergy()
+        print(f"Energy after minimization: {energy_after} kJ/mol")
+        print(f"Minimization steps: {minimization_steps}")
+
+        total_count += minimization_steps
+
+        state = sim.context.getState(getPositions=True)
+        xyz_min = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+
         # make test batch
-        batch = make_batch(pdb_path, args.batch_size)
+        batch = make_batch(pdb_path, xyz_min, args.batch_size)
         batch = to_device(batch, device)
 
         positions = []
-
-        print(f"Start inference for PDB {pdb_name}.")
-        start = time.time()
 
         with torch.no_grad():
             for _ in tqdm(range(args.inf_step)):
@@ -99,10 +111,18 @@ def main(args):
                 x_numpy = x.cpu().numpy() / 10
                 positions.append(x_numpy)
                 # use energy minimization
-                if args.use_energy_minim:
-                    x = torch.from_numpy(spring_constraint_energy_minimization(sim, x_numpy)).to(x.device) * 10
+                if args.use_energy_minim and args.max_iter_energy_minimization > 0:
+                    device = x.device
+                    x, minimization_steps = spring_constraint_energy_minimization(sim, x_numpy, args.max_iter_energy_minimization)
+                    x = torch.from_numpy(x).to(device) * 10  # convert back to tensor
+                    total_count += minimization_steps
+                    print(f"Minimization steps in inference: {minimization_steps}, total count: {total_count}")
                 # update batch
                 batch["x0"] = x  # nm => Angstrom
+
+                if total_count > args.energy_eval_budget:
+                    print(f"Total minimization steps in inference: {total_count}")
+                    break
 
         positions = np.array(positions, dtype=float)    # (T, N, 3)
 
@@ -110,6 +130,8 @@ def main(args):
             positions,
             topology
         ).save_xtc(os.path.join(out_dir, f'{pdb_name}_model_ode{args.sde_step}_inf{args.inf_step}_guidance{args.guidance}.xtc'))
+
+        print(f"Saved trajectory for PDB {pdb_name} to {out_dir}.")
 
         end = time.time()
         elapsed_time = end - start
@@ -128,4 +150,7 @@ if __name__ == "__main__":
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     config = dict_to_namespace(config)
+    config.index = args.index
+    config.max_iter_energy_minimization = args.max_iter_energy_minimization
+    config.energy_eval_budget = args.energy_eval_budget
     main(config)
